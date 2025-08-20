@@ -9,7 +9,12 @@
 <link rel="stylesheet" href="leaflet.css">
 <style>
 html,body,#map{height:100%;margin:0}
-#panel{position:absolute;top:10px;left:10px;z-index:1000;background:#fff;padding:10px 12px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.2);font-family:system-ui, sans-serif;min-width:260px}
+#panel{
+  position:absolute;top:10px;left:10px;z-index:1000;
+  background:#fff;padding:10px 12px;border-radius:12px;
+  box-shadow:0 2px 12px rgba(0,0,0,.2);
+  font-family:system-ui, sans-serif;min-width:260px;max-width:min(92vw,420px)
+}
 #panel h1{font-size:14px; margin:0 0 6px; font-weight:700}
 #panel .row{display:flex; gap:6px; align-items:center; margin:6px 0; flex-wrap:wrap}
 #panel label{font-size:12px}
@@ -22,25 +27,40 @@ button{cursor:pointer}
 </head>
 <body>
 <div id="map"></div>
+
 <div id="panel">
   <h1>実車評価支援ツール</h1>
+
   <div class="row">
-    <input type="file" id="file" accept=".kml,.kmz">
+    <input type="file" id="file" accept=".kml,.kmz,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz">
     <button id="clear">クリア</button>
   </div>
+
   <div class="row">
     <button id="track">位置追跡を開始</button>
     <button id="stop">停止</button>
     <button id="recenter">現在地へ</button>
     <label class="toggle"><input type="checkbox" id="follow" checked> 自動追従</label>
   </div>
+
+  <div class="row">
+    <button id="export">GPXエクスポート</button>
+    <label class="toggle"><input type="checkbox" id="wpExport" checked> チェックポイントも含める</label>
+  </div>
+
   <div class="row"><label>通知距離: <span id="thv" class="badge">100m</span></label></div>
   <input id="th" type="range" min="20" max="300" value="100" style="width:100%">
-  <div class="row"><button id="tts">音声テスト</button><span class="small" id="stat"></span></div>
+
+  <div class="row">
+    <button id="tts">音声テスト</button>
+    <span class="small" id="stat"></span>
+  </div>
+
   <div class="small">※ オンライン時に表示した地図は自動でキャッシュされ、オフラインでも利用可能です。</div>
 </div>
+
 <script>
-// Service Worker 登録
+// Service Worker 登録（PWA/オフライン対応）
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js');
 }
@@ -49,6 +69,9 @@ if ('serviceWorker' in navigator) {
 <script src="jszip.min.js"></script>
 <script src="togeojson.umd.js"></script>
 <script>
+/* =====================
+   地図・レイヤ初期化
+===================== */
 const map = L.map('map', { zoomControl: true }).setView([35.0, 135.0], 14);
 
 const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -56,6 +79,9 @@ const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '&copy; OpenStreetMap contributors'
 }).addTo(map);
 
+/* =====================
+   状態・要素参照
+===================== */
 let threshold = 100;
 let points = [];
 let watchId = null;
@@ -63,32 +89,47 @@ let meLayer = null;
 let routeLayer = null, pointLayer = null;
 let lastHere = null;
 let follow = true;
-let trackLine = null; // ★走行軌跡用
+let trackLine = null;     // 走行軌跡（赤線）
+let trackPoints = [];     // 走行点ログ {lat, lng, time}
 
-const elTh = document.getElementById('th');
-const elThV = document.getElementById('thv');
-const elStat = document.getElementById('stat');
+const elTh     = document.getElementById('th');
+const elThV    = document.getElementById('thv');
+const elStat   = document.getElementById('stat');
 const elFollow = document.getElementById('follow');
+const elPanel  = document.getElementById('panel');
 
+/* =====================
+   UIイベント
+===================== */
 elTh.addEventListener('input', ()=>{ threshold = +elTh.value; elThV.textContent = threshold + 'm'; });
-elFollow.addEventListener('change', ()=>{ follow = elFollow.checked; if (follow && lastHere) map.setView(lastHere); });
-document.getElementById('recenter').addEventListener('click', ()=>{ if(lastHere){ follow = true; elFollow.checked = true; map.setView(lastHere); } });
+elFollow.addEventListener('change', ()=>{ follow = elFollow.checked; if (follow && lastHere) recenterWithOffset(lastHere); });
+document.getElementById('recenter').addEventListener('click', ()=>{ if(lastHere){ follow = true; elFollow.checked = true; recenterWithOffset(lastHere); } });
 document.getElementById('tts').addEventListener('click', ()=> speak('音声テストです'));
 document.getElementById('clear').addEventListener('click', ()=>{
   if(routeLayer) map.removeLayer(routeLayer);
   if(pointLayer) map.removeLayer(pointLayer);
   if(trackLine) { map.removeLayer(trackLine); trackLine = null; }
   points = [];
+  trackPoints = []; // ★軌跡ログもクリア
 });
 document.getElementById('track').addEventListener('click', startTrack);
-document.getElementById('stop').addEventListener('click', ()=>{ if(watchId){ navigator.geolocation.clearWatch(watchId); watchId=null; elStat.textContent=''; }});
+document.getElementById('stop').addEventListener('click', ()=>{
+  if(watchId){ navigator.geolocation.clearWatch(watchId); watchId=null; elStat.textContent=''; }
+});
 document.getElementById('file').addEventListener('change', onFile);
+document.getElementById('export').addEventListener('click', exportGPX);
+
 map.on('dragstart zoomstart', ()=>{ follow = false; elFollow.checked = false; });
 
+/* =====================
+   便利関数
+===================== */
 function speak(text){
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = 'ja-JP';
-  speechSynthesis.speak(u);
+  try{
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'ja-JP';
+    speechSynthesis.speak(u);
+  }catch(e){}
 }
 function dist(a,b){
   const R = 6371000; const toRad = d=> d * Math.PI/180;
@@ -96,11 +137,22 @@ function dist(a,b){
   const s = Math.sin(dlat/2)**2 + Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dlon/2)**2;
   return 2*R*Math.asin(Math.sqrt(s));
 }
+// パネルで隠れないよう、少し上にオフセット
+function recenterWithOffset(latlng){
+  map.setView(latlng, undefined, {animate:false});
+  const y = -(Math.min(elPanel.offsetHeight, 240) + 20) / 2; // 見やすく微調整
+  map.panBy([0, y], {animate:false});
+}
+
+/* =====================
+   KML/KMZ読み込み
+===================== */
 async function onFile(ev){
   const f = ev.target.files[0];
   if(!f) return;
   const isKMZ = /\.kmz$/i.test(f.name);
   let kmlText = null;
+
   if(isKMZ){
     const buf = await f.arrayBuffer();
     const zip = await JSZip.loadAsync(buf);
@@ -118,10 +170,12 @@ async function onFile(ev){
   if(pointLayer) map.removeLayer(pointLayer);
   points = [];
 
+  // ルート（LineStringなど）
   const lineFeats = gj.features.filter(ft => ft.geometry && ft.geometry.type.includes('Line'));
   const lines = lineFeats.map(ft => L.polyline(ft.geometry.coordinates.map(c=>[c[1], c[0]]), {color:'#2b8a3e', weight:4}));
   routeLayer = L.layerGroup(lines).addTo(map);
 
+  // チェックポイント（Point）
   const ptFeats = gj.features.filter(ft => ft.geometry && ft.geometry.type === 'Point');
   pointLayer = L.geoJSON({type:'FeatureCollection', features: ptFeats}, {
     pointToLayer: (ft, latlng)=> L.circleMarker(latlng, {radius:7, color:'#1e3a8a', weight:2, fillColor:'#60a5fa', fillOpacity:.85}),
@@ -137,6 +191,9 @@ async function onFile(ev){
   map.fitBounds(group.getBounds().pad(0.2));
 }
 
+/* =====================
+   位置追跡・通知
+===================== */
 function startTrack(){
   if(watchId) navigator.geolocation.clearWatch(watchId);
   watchId = navigator.geolocation.watchPosition(onPos, onErr, {enableHighAccuracy:true, maximumAge:1000, timeout:10000});
@@ -147,23 +204,27 @@ function onPos(pos){
   const here = L.latLng(latitude, longitude);
   lastHere = here;
   elStat.textContent = `精度 ${Math.round(accuracy||0)}m / 速度 ${speed!=null?Math.round(speed*3.6):'-'}km/h`;
-  
+
+  // 現在地マーカー
   if(!meLayer){
     meLayer = L.circleMarker(here, {radius:8, color:'#dc2626', weight:3, fillColor:'#fecaca', fillOpacity:1}).addTo(map);
   }else{
     meLayer.setLatLng(here);
   }
 
-  // ★走行軌跡追加
+  // 走行軌跡（赤線）
   if(!trackLine){
     trackLine = L.polyline([here], {color:'#f00', weight:3}).addTo(map);
   } else {
     trackLine.addLatLng(here);
   }
+  // 軌跡ログにも保存
+  trackPoints.push({ lat: latitude, lng: longitude, time: new Date(pos.timestamp) });
 
-  // 中央補正（パネル分だけ上にずらす）
-  if(follow){ map.panTo(here, {animate:false}); map.panBy([0,-100]); }
+  // 中央補正（パネル分オフセット）
+  if(follow){ recenterWithOffset(here); }
 
+  // 近接通知
   for(const p of points){
     if(p.announced) continue;
     if(dist(here, p.latlng) <= threshold){
@@ -174,7 +235,62 @@ function onPos(pos){
 }
 function onErr(err){ alert('位置取得に失敗: ' + err.message); }
 
-// ★ クエリパラメータ対応
+/* =====================
+   GPXエクスポート
+===================== */
+function exportGPX(){
+  if (!trackPoints.length) {
+    alert('走行軌跡がありません。まず「位置追跡を開始」で走行してください。');
+    return;
+  }
+  const includeWpts = document.getElementById('wpExport')?.checked ?? true;
+
+  const esc = s => s.replace(/[<&>"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+  let gpx = '';
+  gpx += `<?xml version="1.0" encoding="UTF-8"?>\n`;
+  gpx += `<gpx version="1.1" creator="RouteAid" xmlns="http://www.topografix.com/GPX/1/1" `;
+  gpx += `xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" `;
+  gpx += `xsi:schemaLocation="http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd">\n`;
+
+  // (任意) チェックポイントを wpt として
+  if (includeWpts && points.length) {
+    for (const p of points) {
+      const name = p.name || 'CheckPoint';
+      const desc = p.desc || '';
+      gpx += `  <wpt lat="${p.latlng.lat}" lon="${p.latlng.lng}">\n`;
+      gpx += `    <name>${esc(name)}</name>\n`;
+      if (desc) gpx += `    <desc>${esc(desc)}</desc>\n`;
+      gpx += `  </wpt>\n`;
+    }
+  }
+
+  // 軌跡トラック
+  gpx += `  <trk>\n`;
+  gpx += `    <name>Recorded Track</name>\n`;
+  gpx += `    <trkseg>\n`;
+  for (const pt of trackPoints) {
+    const iso = pt.time instanceof Date ? pt.time.toISOString() : new Date(pt.time).toISOString();
+    gpx += `      <trkpt lat="${pt.lat}" lon="${pt.lng}"><time>${iso}</time></trkpt>\n`;
+  }
+  gpx += `    </trkseg>\n`;
+  gpx += `  </trk>\n`;
+  gpx += `</gpx>\n`;
+
+  const blob = new Blob([gpx], {type: 'application/gpx+xml'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const ts = new Date().toISOString().replace(/[:.]/g,'-');
+  a.href = url;
+  a.download = `routeaid-track-${ts}.gpx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* =====================
+   ショートカット連動 (?track / ?open)
+===================== */
 const params = new URLSearchParams(location.search);
 if (params.get('track') === '1') {
   window.addEventListener('load', () => { document.getElementById('track').click(); });
